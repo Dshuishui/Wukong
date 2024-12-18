@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+option go_package="./;kvrpc";
+
+/* 
+  this rpc is used between kvserver and kvclient
+*/
+
+service KV{
+  rpc GetInRaft (GetInRaftRequest) returns (GetInRaftResponse) {}
+  rpc ScanRangeInRaft (ScanRangeRequest) returns (ScanRangeResponse) {}
+  rpc PutInRaft (PutInRaftRequest) returns (PutInRaftResponse) {}
+}
+
+message GetInRaftRequest {
+  string Key = 1;
+  int64 ClientId = 2;
+  int64 SeqId = 3;
+}
+
+message GetInRaftResponse {
+  string Err = 1;
+  string Value = 2;
+  int32 LeaderId = 3;
+}
+
+message PutInRaftRequest {
+  string Key = 1;
+  string Value = 2;
+  string Op = 3;
+  int64 ClientId = 4;
+  int64 SeqId = 5;
+}
+
+message PutInRaftResponse {
+  string Err = 1;
+  int32 LeaderId = 2;
+}
+
+message ScanRangeRequest {
+  string start_key = 1;
+  string end_key = 2;
+}
+
+message ScanRangeResponse {
+  map<string, string> key_value_pairs = 1;
+  int32 LeaderId = 2; 
+  string Err = 3;
+}
