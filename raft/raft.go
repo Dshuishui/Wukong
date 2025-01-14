@@ -8,6 +8,7 @@ import (
 	"encoding/gob"
 	"log"
 	"strconv"
+	"strings"
 
 	// "encoding/gob"
 	// "encoding/json"
@@ -103,7 +104,11 @@ type Raft struct {
 	// lastBroadcastTime time.Time // 作为leader，上次的广播时间
 
 	applyCh chan ApplyMsg // 应用层的提交队列
-	pools   []pool.Pool   // 用于日志同步的连接池
+	// pools   []pool.Pool   // 用于日志同步的连接池
+	pools     [][]pool.Pool   // 修改为二维数组,每个peer有多个连接池
+    portCount int            // 每个peer的端口数量
+    syncIndex []int32        // 记录每个peer当前使用的端口索引
+	basePorts []int // 每个节点监听的基础端口
 	// kvrpc.UnimplementedKVServer
 	raftrpc.UnimplementedRaftServer
 	LastAppendTime time.Time
@@ -771,44 +776,61 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) RegisterRaftServer(ctx context.Context, address string) { // 传入的地址是internalAddress，节点间交流用的地址（用于类似日志同步等）
-	util.DPrintf("RegisterRaftServer: %s", address)
-	for { // 创建一个TCP监听器，并在指定的地址（）上监听传入的连接。如果监听失败，则会打印错误信息。
-		lis, err := net.Listen("tcp", address)
-		if err != nil {
-			util.FPrintf("failed to listen: %v", err)
-		}
-		grpcServer := grpc.NewServer(
-			grpc.InitialWindowSize(pool.InitialWindowSize),
-			grpc.InitialConnWindowSize(pool.InitialConnWindowSize),
-			grpc.MaxSendMsgSize(pool.MaxSendMsgSize),
-			grpc.MaxRecvMsgSize(pool.MaxRecvMsgSize),
-			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-				PermitWithoutStream: true,
-				MinTime:             10 * time.Second, // 这里设置与client的keepalive探测的最小时间间隔。
-			}),
-			grpc.KeepaliveParams(keepalive.ServerParameters{
-				Time:                  pool.KeepAliveTime,
-				Timeout:               pool.KeepAliveTimeout,
-				MaxConnectionAgeGrace: 20 * time.Second,
-			}),
-		)
-		raftrpc.RegisterRaftServer(grpcServer, rf)
-		reflection.Register(grpcServer)
-
-		go func() {
-			<-ctx.Done()
-			grpcServer.GracefulStop()
-			fmt.Println("Raft stopped due to context cancellation-Raft.")
-		}()
-
-		if err := grpcServer.Serve(lis); err != nil { // 调用Serve方法来启动gRPC服务器，监听传入的连接，并处理相应的请求
-			util.FPrintf("failed to serve: %v", err)
-		}
-
-		fmt.Println("跳出Raftserver的for循环，日志同步完成")
-		break
-	}
+func (rf *Raft) RegisterRaftServer(ctx context.Context, baseAddr string) {
+    // 从基础地址中获取主机名和基础端口
+    host := strings.Split(baseAddr, ":")[0]
+    basePort, _ := strconv.Atoi(strings.Split(baseAddr, ":")[1])
+    
+    // 创建多个监听器，每个都在不同的端口上
+    for portOffset := 0; portOffset < 3; portOffset++ { // 使用3个端口
+        port := basePort + portOffset
+        address := fmt.Sprintf("%s:%d", host, port)
+        
+        // 为每个端口启动一个独立的gRPC服务器
+        go func(addr string) {
+            for {
+                lis, err := net.Listen("tcp", addr)
+                if err != nil {
+                    util.FPrintf("failed to listen on %s: %v", addr, err)
+                    time.Sleep(time.Second) // 如果监听失败，等待一会再重试
+                    continue
+                }
+                
+                grpcServer := grpc.NewServer(
+                    grpc.InitialWindowSize(pool.InitialWindowSize),
+                    grpc.InitialConnWindowSize(pool.InitialConnWindowSize),
+                    grpc.MaxSendMsgSize(pool.MaxSendMsgSize),
+                    grpc.MaxRecvMsgSize(pool.MaxRecvMsgSize),
+                    grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+                        PermitWithoutStream: true,
+                        MinTime:             10 * time.Second,
+                    }),
+                    grpc.KeepaliveParams(keepalive.ServerParameters{
+                        Time:                  pool.KeepAliveTime,
+                        Timeout:               pool.KeepAliveTimeout,
+                        MaxConnectionAgeGrace: 20 * time.Second,
+                    }),
+                )
+                
+                raftrpc.RegisterRaftServer(grpcServer, rf)
+                reflection.Register(grpcServer)
+                
+                // 处理服务器优雅关闭
+                go func() {
+                    <-ctx.Done()
+                    grpcServer.GracefulStop()
+                    fmt.Printf("Raft stopped on port %s due to context cancellation\n", addr)
+                }()
+                
+                util.DPrintf("Starting Raft server on: %s", addr)
+                if err := grpcServer.Serve(lis); err != nil {
+                    util.FPrintf("failed to serve on %s: %v", addr, err)
+                }
+                
+                break // 如果Serve返回错误，跳出循环
+            }
+        }(address)
+    }
 }
 
 func (rf *Raft) sendRequestVote(address string, args *raftrpc.RequestVoteRequest) (bool, *raftrpc.RequestVoteResponse) {
@@ -833,46 +855,76 @@ func (rf *Raft) sendRequestVote(address string, args *raftrpc.RequestVoteRequest
 	}
 }
 
-func (rf *Raft) sendAppendEntries(address string, args *raftrpc.AppendEntriesInRaftRequest, p pool.Pool) (*raftrpc.AppendEntriesInRaftResponse, bool) {
-	// 用grpc连接池同步日志
-	conn, err := p.Get()
-	if err != nil {
-		util.EPrintf("failed to get conn: %v", err)
-		return nil, false
+// func (rf *Raft) sendAppendEntries(address string, args *raftrpc.AppendEntriesInRaftRequest, p pool.Pool) (*raftrpc.AppendEntriesInRaftResponse, bool) {
+// 	// 用grpc连接池同步日志
+// 	conn, err := p.Get()
+// 	if err != nil {
+// 		util.EPrintf("failed to get conn: %v", err)
+// 		return nil, false
 
-	}
-	defer conn.Close()
-	client := raftrpc.NewRaftClient(conn.Value())
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-	defer cancel()
-	reply, err := client.AppendEntriesInRaft(ctx, args)
+// 	}
+// 	defer conn.Close()
+// 	client := raftrpc.NewRaftClient(conn.Value())
+// 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+// 	defer cancel()
+// 	reply, err := client.AppendEntriesInRaft(ctx, args)
 
-	if err != nil {
+// 	if err != nil {
+// 		// util.EPrintf("Error calling AppendEntriesInRaft method on server side; err:%v; address:%v ", err, address)
+// 		return reply, false
+// 	}
+// 	return reply, true
+// }
+// 修改sendAppendEntries函数使用多端口
+func (rf *Raft) sendAppendEntries(address string, args *raftrpc.AppendEntriesInRaftRequest, peerId int) (*raftrpc.AppendEntriesInRaftResponse, bool) {
+    // 轮询选择端口
+    poolIndex := atomic.AddInt32(&rf.syncIndex[peerId], 1) % int32(rf.portCount)
+    p := rf.pools[peerId][poolIndex]
+    
+    conn, err := p.Get()
+    if err != nil {
+        util.EPrintf("failed to get conn: %v", err)
+        return nil, false
+    }
+    defer conn.Close()
+    
+    client := raftrpc.NewRaftClient(conn.Value())
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+    defer cancel()
+    
+    reply, err := client.AppendEntriesInRaft(ctx, args)
+    if err != nil {
 		// util.EPrintf("Error calling AppendEntriesInRaft method on server side; err:%v; address:%v ", err, address)
-		return reply, false
-	}
-	return reply, true
+        return reply, false
+    }
+    return reply, true
 }
 
-func (rf *Raft) sendHeartbeat(address string, args *raftrpc.AppendEntriesInRaftRequest, p pool.Pool) (*raftrpc.AppendEntriesInRaftResponse, bool) {
-	// 用grpc连接池同步日志
-	conn, err := p.Get()
-	if err != nil {
-		util.EPrintf("failed to get conn: %v", err)
-		return nil, false
+func (rf *Raft) sendHeartbeat(address string, args *raftrpc.AppendEntriesInRaftRequest, peerId int) (*raftrpc.AppendEntriesInRaftResponse, bool) {
+    // 轮询选择一个连接池
+    poolIndex := atomic.AddInt32(&rf.syncIndex[peerId], 1) % int32(len(rf.pools[peerId]))
+    p := rf.pools[peerId][poolIndex]
+    
+    // 使用选择的连接池获取连接
+    conn, err := p.Get()
+    if err != nil {
+        util.EPrintf("failed to get conn for heartbeat: %v", err)
+        return nil, false
+    }
+    defer conn.Close()
 
-	}
-	defer conn.Close()
-	client := raftrpc.NewRaftClient(conn.Value())
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*4)
-	defer cancel()
-	reply, err := client.HeartbeatInRaft(ctx, args)
+    client := raftrpc.NewRaftClient(conn.Value())
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*4)
+    defer cancel()
 
-	if err != nil {
-		util.EPrintf("Error calling HeartbeatInRaft method on server side; err:%v; address:%v ", err, address)
-		return reply, false
-	}
-	return reply, true
+    reply, err := client.HeartbeatInRaft(ctx, args)
+
+    if err != nil {
+        util.EPrintf("Error calling HeartbeatInRaft method on server side; err:%v; address:%v poolIndex:%d", 
+            err, address, poolIndex)
+        return reply, false
+    }
+    return reply, true
 }
 
 func (rf *Raft) AppendMonitor() {
@@ -1098,7 +1150,7 @@ func (rf *Raft) doAppendEntries(peerId int) {
 
 	go func(peerId int) {
 		// util.DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args.Term, args.LeaderId)
-		if reply, ok := rf.sendAppendEntries(rf.peers[peerId], &args, rf.pools[peerId]); ok {
+		if reply, ok := rf.sendAppendEntries(rf.peers[peerId], &args, peerId); ok {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			// defer func() {
@@ -1165,81 +1217,82 @@ func (rf *Raft) doAppendEntries(peerId int) {
 	}(peerId)
 }
 
+// 对应地需要修改调用sendHeartbeat的地方，比如在doHeartBeat中
 func (rf *Raft) doHeartBeat(peerId int) {
-	args := raftrpc.AppendEntriesInRaftRequest{}
-	args.Term = int32(rf.currentTerm)
-	args.LeaderId = int32(rf.me)
-	args.LeaderCommit = int32(rf.commitIndex)
-	args.PrevLogIndex = int32(rf.nextIndex[peerId] - 1)
-	if args.PrevLogIndex == 0 { // 确保在从0开始的时候直接进行日志追加即可
-		args.PrevLogTerm = 0
-	} else {
-		args.PrevLogTerm = int32(rf.log[rf.index2LogPos(int(args.PrevLogIndex))].Term)
-	}
-	args.Entries = []*raftrpc.LogEntry{}
-	go func(peerId int) {
-		if reply, ok := rf.sendHeartbeat(rf.peers[peerId], &args, rf.pools[peerId]); ok {
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			if rf.currentTerm != int(args.Term) {
-				return
-			}
-			if reply.Term > int32(rf.currentTerm) { // 变成follower
-				rf.role = ROLE_FOLLOWER
-				// rf.leaderId = 0
-				rf.currentTerm = int(reply.Term)
-				rf.votedFor = -1
-				// rf.raftStateForPersist("./raft/RaftState.log", rf.currentTerm, rf.votedFor, rf.log)
-				return
-			}
-			// rf.SyncChans[peerId] <- strconv.Itoa(peerId)
-		}
-		// rf.SyncChans[peerId] <- strconv.Itoa(peerId)
-	}(peerId)
+    args := raftrpc.AppendEntriesInRaftRequest{
+        Term:         int32(rf.currentTerm),
+        LeaderId:     int32(rf.me),
+        LeaderCommit: int32(rf.commitIndex),
+        PrevLogIndex: int32(rf.nextIndex[peerId] - 1),
+    }
+    
+    if args.PrevLogIndex == 0 {
+        args.PrevLogTerm = 0
+    } else {
+        args.PrevLogTerm = int32(rf.log[rf.index2LogPos(int(args.PrevLogIndex))].Term)
+    }
+    args.Entries = []*raftrpc.LogEntry{}
+
+    go func(peerId int) {
+        if reply, ok := rf.sendHeartbeat(rf.peers[peerId], &args, peerId); ok {
+            rf.mu.Lock()
+            defer rf.mu.Unlock()
+            
+            if rf.currentTerm != int(args.Term) {
+                return
+            }
+            
+            if reply.Term > int32(rf.currentTerm) {
+                rf.role = ROLE_FOLLOWER
+                rf.currentTerm = int(reply.Term)
+                rf.votedFor = -1
+                return
+            }
+        }
+    }(peerId)
 }
 
 func (rf *Raft) CheckActive(peerId int, resultChan chan<- bool) {
-	args := raftrpc.AppendEntriesInRaftRequest{}
-	args.Term = int32(rf.currentTerm)
-	args.LeaderId = int32(rf.me)
-	args.LeaderCommit = int32(rf.commitIndex)
-	args.PrevLogIndex = int32(rf.nextIndex[peerId] - 1)
-	if args.PrevLogIndex == 0 { // 确保在从0开始的时候直接进行日志追加即可
-		args.PrevLogTerm = 0
-	} else {
-		args.PrevLogTerm = int32(rf.log[rf.index2LogPos(int(args.PrevLogIndex))].Term)
-	}
-	args.Entries = []*raftrpc.LogEntry{}
-	if reply, ok := rf.sendHeartbeat(rf.peers[peerId], &args, rf.pools[peerId]); ok {
-		rf.mu.Lock()
-		// defer rf.mu.Unlock()
-		if rf.currentTerm != int(args.Term) {
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Term > int32(rf.currentTerm) { // 变成follower
-			rf.role = ROLE_FOLLOWER
-			// rf.leaderId = 0
-			rf.currentTerm = int(reply.Term)
-			rf.votedFor = -1
-			// rf.raftStateForPersist("./raft/RaftState.log", rf.currentTerm, rf.votedFor, rf.log)
-			rf.mu.Unlock()
-			return
-		}
-		if reply.Success {
-			// fmt.Printf("receive true from node %v\n", peerId)
-			resultChan <- true
-		} else {
-			// fmt.Printf("receive false from node %v\n", peerId)
-			resultChan <- false
-		}
-		rf.mu.Unlock()
-	} else {
-		fmt.Printf("Failed to send heartbeat to node %v\n", peerId)
-		resultChan <- false
-		return
-	}
+    args := raftrpc.AppendEntriesInRaftRequest{
+        Term:         int32(rf.currentTerm),
+        LeaderId:     int32(rf.me),
+        LeaderCommit: int32(rf.commitIndex),
+        PrevLogIndex: int32(rf.nextIndex[peerId] - 1),
+    }
+    
+    if args.PrevLogIndex == 0 {
+        args.PrevLogTerm = 0
+    } else {
+        args.PrevLogTerm = int32(rf.log[rf.index2LogPos(int(args.PrevLogIndex))].Term)
+    }
+    args.Entries = []*raftrpc.LogEntry{}
+
+    if reply, ok := rf.sendHeartbeat(rf.peers[peerId], &args, peerId); ok {
+        rf.mu.Lock()
+        if rf.currentTerm != int(args.Term) {
+            rf.mu.Unlock()
+            return
+        }
+        
+        if reply.Term > int32(rf.currentTerm) {
+            rf.role = ROLE_FOLLOWER
+            rf.currentTerm = int(reply.Term)
+            rf.votedFor = -1
+            rf.mu.Unlock()
+            return
+        }
+        
+        if reply.Success {
+            resultChan <- true
+        } else {
+            resultChan <- false
+        }
+        rf.mu.Unlock()
+    } else {
+        resultChan <- false
+    }
 }
+
 
 func (rf *Raft) GetReadIndex() (commitindex int, isleader bool) {
 	rf.mu.Lock()
@@ -1587,24 +1640,33 @@ func Make(peers []string, me int,
 	rf.applyCh = applyCh
 	rf.Offsets = append(rf.Offsets, 0) // 初始化时添加一个0，使得后续对index的访问和raft的对其，从1开始
 
-	// 这就是自己修改grpc线程池option参数的做法
-	DesignOptions := pool.Options{
-		Dial:                 pool.Dial,
-		MaxIdle:              150,
-		MaxActive:            300,
-		MaxConcurrentStreams: 800,
-		Reuse:                true,
-	}
-	// 根据servers的地址，创建了一一对应server地址的grpc连接池
-	for i := 0; i < len(peers); i++ {
-		peers_single := []string{peers[i]}
-		p, err := pool.New(peers_single, DesignOptions)
-		if err != nil {
-			util.EPrintf("failed to new pool: %v", err)
-		}
-		// grpc连接池组
-		rf.pools = append(rf.pools, p)
-	}
+	// 初始化 syncIndex
+    rf.syncIndex = make([]int32, len(peers))
+    // 初始化连接池
+    rf.pools = make([][]pool.Pool, len(peers))
+    for i := 0; i < len(peers); i++ {
+        rf.pools[i] = make([]pool.Pool, 3) // 为每个peer创建3个连接池
+        
+        // 解析基础地址
+        peerHost := strings.Split(peers[i], ":")[0]
+        basePort, _ := strconv.Atoi(strings.Split(peers[i], ":")[1])
+        
+        // 为每个端口创建连接池
+        for j := 0; j < 3; j++ {
+            addr := fmt.Sprintf("%s:%d", peerHost, basePort+j)
+            p, err := pool.New([]string{addr}, pool.Options{
+                Dial:                 pool.Dial,
+                MaxIdle:              50,
+                MaxActive:            150,
+                MaxConcurrentStreams: 400,
+                Reuse:               true,
+            })
+            if err != nil {
+                util.EPrintf("failed to new pool for %s: %v", addr, err)
+            }
+            rf.pools[i][j] = p
+        }
+    }
 
 	util.DPrintf("RaftNode[%d] Make again", rf.me)
 	rf.LastAppendTime = time.Now()
@@ -1626,8 +1688,10 @@ func Make(peers []string, me int,
 	go func() {
 		for range ticker.C {
 			if rf.killed() { // 如果上次KVS关闭了Raft，则可以关闭pool
-				for _, pool := range rf.pools {
-					pool.Close()
+				for i := range rf.pools {
+					for j := range rf.pools[i] {
+						rf.pools[i][j].Close()
+					}
 				}
 				util.DPrintf("The raft pool has been closed")
 				util.DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d] Offsets[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex, rf.Offsets)
